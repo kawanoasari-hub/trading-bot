@@ -7,6 +7,7 @@ from monitor import run_monitor
 
 app = FastAPI()
 
+
 # =========================
 # UI
 # =========================
@@ -15,15 +16,17 @@ def dashboard():
     with open("index.html", "r", encoding="utf-8") as f:
         return f.read()
 
+
 # =========================
-# positions
+# 状態取得
 # =========================
 @app.get("/positions")
 def positions():
     return get_open_positions()
 
+
 # =========================
-# run batch
+# バッチ実行（監視＋判定）
 # =========================
 @app.post("/run")
 def run():
@@ -32,8 +35,9 @@ def run():
     try_exits()
     return {"status": "done"}
 
+
 # =========================
-# entry
+# ENTRY（UI）
 # =========================
 @app.post("/entry")
 def entry(
@@ -55,14 +59,15 @@ def entry(
         "entry_price2": p2,
         "qty1": q1,
         "qty2": q2,
-        "notional": p1*q1 + p2*q2,
+        "notional": p1 * q1 + p2 * q2,
         "zscore_entry": 0
     })
 
     return {"status": "entry saved"}
 
+
 # =========================
-# exit
+# EXIT（UI）
 # =========================
 @app.post("/exit")
 def exit(
