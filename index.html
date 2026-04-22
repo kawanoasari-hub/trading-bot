@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html>
+<body>
+
+<h1>Trading Bot</h1>
+
+<button onclick="run()">Run</button>
+<button onclick="load()">Positions</button>
+
+<pre id="out"></pre>
+
+<script>
+async function run(){
+  let res = await fetch('/run', {method:'POST'})
+  let data = await res.json()
+  document.getElementById('out').innerText = JSON.stringify(data,null,2)
+}
+
+async function load(){
+  let res = await fetch('/positions')
+  let data = await res.json()
+  document.getElementById('out').innerText = JSON.stringify(data,null,2)
+}
+</script>
+
+</body>
+</html>

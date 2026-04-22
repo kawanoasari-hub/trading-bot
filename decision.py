@@ -1,175 +1,197 @@
-import numpy as np
-import pandas as pd
-import requests
+import sqlite3
+from datetime import datetime
 
-from model import z_zone_score, mean_reversion_speed, expected_value
-from pair_state import PAIR_STATE, save_state
-from log import write_log
-from position_db import open_position, close_position
+from trade_db import get_open_positions
+from config import MAX_NOTIONAL
+from telegram_bot import send_message
 
 
-TOKEN="8346759189:AAFVguKLUuJSXIdjTn-uXQevMEcu35Q-aGA"
-CHAT_ID="7919205087"
+def get_market_state():
+
+    conn = sqlite3.connect("trades.db")
+    c = conn.cursor()
+
+    c.execute("""
+    SELECT pair_id, s1, s2,
+           beta, half_life, spread_std,
+           current_price1, current_price2,
+           zscore_current
+    FROM market_state
+    """)
+
+    rows = c.fetchall()
+    conn.close()
+    return rows
 
 
-def send_message(msg):
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": CHAT_ID, "text": msg})
+def has_position(pair_id):
+    return any(r[1] == pair_id for r in get_open_positions())
 
 
-def calc_pnl(s):
-    if s.get("entry_price1") is None:
-        return 0
+def entry_condition(z, hl, vol):
 
-    return (
-        (s["last_price1"] - s["entry_price1"]) * s["qty1"]
-        +
-        (s["last_price2"] - s["entry_price2"]) * s["qty2"]
-    )
+    if abs(z) < 1.5:
+        return False
 
+    if abs(z) > 3.0:
+        return False
 
-def has_position(s):
-    return (
-        s.get("status") == "OPEN"
-        and s.get("qty1", 0) > 0
-        and s.get("qty2", 0) > 0
-        and s.get("entry_price1") is not None
-        and s.get("entry_price2") is not None
-    )
+    if hl > 50:
+        return False
+
+    if vol <= 0:
+        return False
+
+    return True
 
 
-def is_entry_signal(c):
-    return (
-        c["score"] >= 0.65 and
-        abs(c["z"]) >= 1.2 and
-        c["risk"] < 1
-    )
+# =========================
+# ロット計算（ボラ追加版）
+# =========================
+def calc_size(p1, p2, beta, spread_std):
 
+    w1 = 1
+    w2 = abs(beta)
 
-def calc_position_size(s, max_notional=1_500_000):
+    total = w1 + w2
 
-    p1 = s["last_price1"]
-    p2 = s["last_price2"]
-    beta = abs(s.get("beta", 1))
+    alloc1 = MAX_NOTIONAL * (w1 / total)
+    alloc2 = MAX_NOTIONAL * (w2 / total)
 
-    if p1 * 100 + p2 * 100 > max_notional:
-        return 0, 0
+    # ボラ補正
+    vol = max(spread_std, 1e-6)
+    vol_scale = 1 / vol
+    vol_scale = max(0.5, min(vol_scale, 2.0))
 
-    spread = s.get("spread_series", [])
-
-    vol = np.std(spread[-20:]) if len(spread) >= 20 else 0.02
-    vol_adj = min(3, 1 / (vol + 1e-6))
-
-    w1, w2 = 1, beta
-    total_w = w1 + w2
-
-    alloc1 = max_notional * vol_adj * (w1 / total_w)
-    alloc2 = max_notional * vol_adj * (w2 / total_w)
+    alloc1 *= vol_scale
+    alloc2 *= vol_scale
 
     qty1 = max(100, int(alloc1 / p1) // 100 * 100)
     qty2 = max(100, int(alloc2 / p2) // 100 * 100)
 
-    while qty1 * p1 + qty2 * p2 > max_notional:
-        if qty1 > qty2 and qty1 > 100:
-            qty1 -= 100
-        elif qty2 > 100:
-            qty2 -= 100
-        else:
-            return 0, 0
-
     return qty1, qty2
 
 
-def get_trade_direction(z):
-    return "SHORT_1_LONG_2" if z > 0 else "LONG_1_SHORT_2"
+def try_entries():
 
+    states = get_market_state()
 
-def calc_score(s):
-    z = s.get("zscore", 0)
-    risk = s.get("regime_risk", 0)
+    candidates = []
 
-    spread = s.get("spread_series", [])
-    speed = mean_reversion_speed(pd.Series(spread)) if len(spread) >= 10 else 0.3
+    for row in states:
 
-    return float(
-        z_zone_score(z) * 0.4 +
-        speed * 0.3 +
-        expected_value(z, speed, risk) * 0.3
-    )
+        pair_id, s1, s2, beta, hl, vol, p1, p2, z = row
 
-
-def decide_all():
-
-    entry_candidates = []
-    exit_candidates = []
-
-    for pair_id, s in PAIR_STATE.items():
-
-        z = s.get("zscore", 0)
-        risk = s.get("regime_risk", 0)
-
-        score = calc_score(s)
-        s["score"] = score
-
-        if not has_position(s):
-            entry_candidates.append({
-                "pair": pair_id,
-                "score": score,
-                "z": z,
-                "risk": risk,
-                "state": s
-            })
-        else:
-            if risk >= 2 or abs(z) < 0.4:
-                exit_candidates.append({
-                    "pair": pair_id,
-                    "pnl": calc_pnl(s),
-                    "z": z,
-                    "state": s
-                })
-
-        write_log({"pair": pair_id, "z": z, "score": score})
-
-    # ENTRY
-    entry_candidates.sort(key=lambda x: x["score"], reverse=True)
-    filtered = [c for c in entry_candidates if is_entry_signal(c)]
-
-    msg = "🟢 ENTRY SIGNALS\n\n"
-
-    for c in filtered[:3]:
-        s = c["state"]
-
-        qty1, qty2 = calc_position_size(s)
-        if qty1 == 0:
+        if has_position(pair_id):
             continue
 
-        direction = get_trade_direction(c["z"])
+        if not entry_condition(z, hl, vol):
+            continue
 
-        side1 = "BUY" if direction == "LONG_1_SHORT_2" else "SELL"
-        side2 = "BUY" if direction == "SHORT_1_LONG_2" else "SELL"
+        # スコア計算
+        score = abs(z) - (hl / 40)
+
+        candidates.append((score, row))
+
+    # スコア順にソート
+    candidates.sort(reverse=True, key=lambda x: x[0])
+
+    # TOP3抽出
+    top = candidates[:3]
+
+    if not top:
+        print("No entry")
+        return
+
+    msg = "🟢 *TOP 3 ENTRY SIGNALS*\n\n"
+
+    for score, row in top:
+
+        pair_id, s1, s2, beta, hl, vol, p1, p2, z = row
+
+        qty1, qty2 = calc_size(p1, p2, beta, vol)
+
+        # 売買方向
+        if z < 0:
+            direction = "LONG_SHORT"
+            side1 = "🟢 BUY"
+            side2 = "🔴 SELL"
+        else:
+            direction = "SHORT_LONG"
+            side1 = "🔴 SELL"
+            side2 = "🟢 BUY"
 
         msg += (
-            f"{c['pair']}\n"
-            f"{s['s1']} → {side1} {qty1}株\n"
-            f"{s['s2']} → {side2} {qty2}株\n\n"
-            f"▶ コマンド（自由入力）\n"
-            f"/entry {c['pair']} [p1] [p2] {qty1} {qty2}\n\n"
+            f"📌 {pair_id}\n"
+            f"Direction: {direction}\n"
+            f"Score: {score:.3f}\n"
+            f"Z-score: {z:.2f}\n"
+            f"Half-life: {hl:.1f}\n"
+            f"{side1} {s1}: {qty1} @ {p1:.1f}\n"
+            f"{side2} {s2}: {qty2} @ {p2:.1f}\n\n"
         )
 
-    if not filtered:
-        msg = "🟡 ENTRYなし"
+    msg += f"（全候補数: {len(candidates)}）"
 
+    print(msg)
     send_message(msg)
 
-    # EXIT
-    for c in exit_candidates[:3]:
-        send_message(
-            f"🔴 EXIT\n{c['pair']}\n"
-            f"/exit {c['pair']}"
-        )
 
-    save_state(PAIR_STATE)
+def try_exits():
 
+    states = get_market_state()
+    state_map = {r[0]: r for r in states}
 
-if __name__ == "__main__":
-    decide_all()
+    positions = get_open_positions()
+
+    for pos in positions:
+
+        pair_id = pos[1]
+        entry_time = pos[5]
+        pnl = pos[12]
+
+        if pair_id not in state_map:
+            continue
+
+        z = state_map[pair_id][8]
+
+        try:
+            entry_dt = datetime.fromisoformat(entry_time)
+            hours = (datetime.now() - entry_dt).total_seconds() / 3600
+        except:
+            hours = 0
+
+        # 平均回帰
+        if abs(z) < 0.3:
+            msg = (
+                f"🔵 *EXIT候補 (Mean Revert)*\n"
+                f"{pair_id}\n"
+                f"PnL: {int(pnl):,}円\n"
+                f"Z: {z:.2f}"
+            )
+            print(msg)
+            send_message(msg)
+            continue
+
+        # 損切り
+        if pnl < -MAX_NOTIONAL * 0.02:
+            msg = (
+                f"🔴 *STOP LOSS候補*\n"
+                f"{pair_id}\n"
+                f"PnL: {int(pnl):,}円"
+            )
+            print(msg)
+            send_message(msg)
+            continue
+
+        # 時間切れ
+        if hours > 48:
+            msg = (
+                f"⏰ *TIME EXIT候補*\n"
+                f"{pair_id}\n"
+                f"保有時間: {hours:.1f}h\n"
+                f"PnL: {int(pnl):,}円"
+            )
+            print(msg)
+            send_message(msg)
+            continue

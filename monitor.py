@@ -1,95 +1,125 @@
 import yfinance as yf
 import numpy as np
-import statsmodels.api as sm
+import time
 
-from pair_state import PAIR_STATE, save_state
+from trade_db import (
+    init_db,
+    get_open_positions,
+    update_position_state,
+    upsert_market_state
+)
+
+LOOKBACK = 60  # ←変更
+
+# =========================
+# キャッシュ
+# =========================
+_price_cache = None
+_last_fetch = 0
+CACHE_TTL = 0  # ←変更（キャッシュ無効）
 
 
-LOOKBACK = 120
+def get_pairs(conn):
+    c = conn.cursor()
+    c.execute("""
+    SELECT pair_id, s1, s2, beta, half_life, spread_std
+    FROM pairs
+    WHERE status='WATCH'
+    """)
+    return c.fetchall()
+
+
+def get_price_data(tickers):
+    global _price_cache, _last_fetch
+
+    now = time.time()
+
+    if _price_cache is not None and (now - _last_fetch) < CACHE_TTL:
+        return _price_cache
+
+    print("📥 downloading market data...")
+
+    data = yf.download(
+        tickers,
+        period="1mo",   # ←変更
+        interval="1h",  # ←変更
+        auto_adjust=True,
+        progress=False,
+        threads=True
+    )["Close"].ffill()
+
+    _price_cache = data
+    _last_fetch = now
+
+    return data
 
 
 def run_monitor():
 
-    tickers = list(set([v["s1"] for v in PAIR_STATE.values()] +
-                       [v["s2"] for v in PAIR_STATE.values()]))
+    import sqlite3
+    conn = sqlite3.connect("trades.db")
 
-    data = yf.download(
-        tickers,
-        period="6mo",
-        auto_adjust=True,
-        progress=False
-    )["Close"].ffill()
+    pairs = get_pairs(conn)
 
-    for pid, s in PAIR_STATE.items():
+    if not pairs:
+        print("no pairs")
+        return
 
-        p1 = data[s["s1"]].tail(LOOKBACK)
-        p2 = data[s["s2"]].tail(LOOKBACK)
+    tickers = list(set([p[1] for p in pairs] + [p[2] for p in pairs]))
 
-        log1 = np.log(p1)
-        log2 = np.log(p2)
+    data = get_price_data(tickers)
 
-        beta = s["beta"]
+    open_positions = get_open_positions()
 
-        spread = log1 - beta * log2
+    print("monitor updated:", len(pairs))
 
-        # =========================
-        # z-score
-        # =========================
-        mean = spread.mean()
-        std = spread.std()
-        z = (spread.iloc[-1] - mean) / std
-
-        # =========================
-        # half-life簡易更新
-        # =========================
-        lag = spread.shift(1)
-        delta = spread - lag
-        df = np.column_stack([delta, lag]).astype(float)
-        df = np.nan_to_num(df)
+    for pair_id, s1, s2, beta, hl, vol in pairs:
 
         try:
-            beta_hl = sm.OLS(df[:,0], sm.add_constant(df[:,1])).fit().params[1]
-            half_life = -np.log(2) / beta_hl if beta_hl < 0 else 999
-        except:
-            half_life = 999
+            if s1 not in data.columns or s2 not in data.columns:
+                continue
 
-        # =========================
-        # スコア（本来版）
-        # =========================
-        score = (
-            abs(z) * 2.0 +
-            (1 / (half_life + 1)) * 10 +
-            (0.7 if abs(z) > 1.5 else 0)
-        )
+            p1 = data[s1].tail(LOOKBACK)
+            p2 = data[s2].tail(LOOKBACK)
 
-        # =========================
-        # リスク簡易評価（monitor側）
-        # =========================
-        vol = spread.std()
-        risk = 1 if vol > spread.std() * 1.5 else 0
+            if len(p1.dropna()) < 50:
+                continue
 
-        # =========================
-        # state更新
-        # =========================
-        s["zscore"] = float(z)
-        s["score"] = float(score)
-        s["half_life"] = float(half_life)
-        s["regime_risk"] = int(risk)
+            log1 = np.log(p1)
+            log2 = np.log(p2)
 
-        # 現在価格（PnL用）
-        s["last_price1"] = float(p1.iloc[-1])
-        s["last_price2"] = float(p2.iloc[-1])
+            spread = log1 - beta * log2
 
-        # シグナル
-        if abs(z) > 1.5:
-            s["signal"] = "ENTRY"
-        elif abs(z) < 0.5:
-            s["signal"] = "EXIT"
-        else:
-            s["signal"] = "HOLD"
+            std = spread.std()
+            if std == 0:
+                continue
 
-    save_state(PAIR_STATE)
+            z = (spread.iloc[-1] - spread.mean()) / std
 
+            p1_last = float(p1.iloc[-1])
+            p2_last = float(p2.iloc[-1])
 
-if __name__ == "__main__":
-    run_monitor()
+            target = next((r for r in open_positions if r[1] == pair_id), None)
+
+            pnl = 0
+
+            if target:
+                entry_p1 = target[6]
+                entry_p2 = target[7]
+                qty1 = target[8]
+                qty2 = target[9]
+
+                pnl = (p1_last - entry_p1) * qty1 + (entry_p2 - p2_last) * qty2
+
+            update_position_state(pair_id, p1_last, p2_last, pnl, z)
+
+            upsert_market_state((
+                pair_id, s1, s2,
+                beta, hl, vol,
+                p1_last, p2_last,
+                z,
+                None
+            ))
+
+        except Exception as e:
+            print("error:", pair_id, e)
