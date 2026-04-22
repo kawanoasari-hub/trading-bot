@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Form, Request
+from fastapi import FastAPI, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
 from trade_db import get_open_positions, open_position, close_position
 from decision import try_entries, try_exits
@@ -7,8 +7,15 @@ import os
 
 app = FastAPI()
 
+# =========================
+# ログイン設定
+# =========================
 APP_PASSWORD = os.environ.get("APP_PASSWORD")
-SESSION = {}  # 超簡易セッション（本番は非推奨だが今はOK）
+SESSION = {"logged_in": False}
+
+
+def check_login():
+    return SESSION.get("logged_in", False)
 
 
 # =========================
@@ -17,9 +24,9 @@ SESSION = {}  # 超簡易セッション（本番は非推奨だが今はOK）
 @app.get("/login", response_class=HTMLResponse)
 def login_page():
     return """
-    <h2>Login</h2>
+    <h1>Login</h1>
     <form method="post" action="/login">
-        <input name="password" type="password" placeholder="password">
+        <input type="password" name="password" placeholder="password">
         <button type="submit">Login</button>
     </form>
     """
@@ -28,16 +35,15 @@ def login_page():
 @app.post("/login")
 def login(password: str = Form(...)):
     if password == APP_PASSWORD:
-        SESSION["auth"] = True
-        return RedirectResponse(url="/", status_code=302)
-    return HTMLResponse("❌ パスワード違う", status_code=401)
+        SESSION["logged_in"] = True
+        return RedirectResponse("/", status_code=302)
+    return HTMLResponse("wrong password", status_code=401)
 
 
-# =========================
-# 認証チェック関数
-# =========================
-def check_auth():
-    return SESSION.get("auth", False)
+@app.get("/logout")
+def logout():
+    SESSION["logged_in"] = False
+    return RedirectResponse("/login", status_code=302)
 
 
 # =========================
@@ -45,29 +51,30 @@ def check_auth():
 # =========================
 @app.get("/", response_class=HTMLResponse)
 def dashboard():
-
-    if not check_auth():
-        return RedirectResponse(url="/login")
+    if not check_login():
+        return RedirectResponse("/login")
 
     with open("index.html", "r", encoding="utf-8") as f:
         return f.read()
 
 
 # =========================
-# 状態確認
+# ポジション確認
 # =========================
 @app.get("/positions")
 def positions():
+    if not check_login():
+        return {"error": "unauthorized"}
+
     return get_open_positions()
 
 
 # =========================
-# run
+# 監視＋シグナル実行
 # =========================
 @app.post("/run")
 def run():
-
-    if not check_auth():
+    if not check_login():
         return {"error": "unauthorized"}
 
     run_monitor()
@@ -89,6 +96,9 @@ def entry(
     q2: int = Form(...)
 ):
 
+    if not check_login():
+        return {"error": "unauthorized"}
+
     s1, s2 = pair.split("-")
 
     open_position({
@@ -100,7 +110,7 @@ def entry(
         "entry_price2": p2,
         "qty1": q1,
         "qty2": q2,
-        "notional": p1*q1 + p2*q2,
+        "notional": p1 * q1 + p2 * q2,
         "zscore_entry": 0
     })
 
@@ -116,6 +126,9 @@ def exit(
     p1: float = Form(...),
     p2: float = Form(...)
 ):
+
+    if not check_login():
+        return {"error": "unauthorized"}
 
     rows = get_open_positions()
     target = next((r for r in rows if r[1] == pair), None)
