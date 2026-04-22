@@ -1,22 +1,60 @@
-from fastapi import FastAPI, Form
-from fastapi.responses import HTMLResponse
-
+from fastapi import FastAPI, Form, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
 from trade_db import get_open_positions, open_position, close_position
+from decision import try_entries, try_exits
+from monitor import run_monitor
+import os
 
 app = FastAPI()
 
+APP_PASSWORD = os.environ.get("APP_PASSWORD")
+SESSION = {}  # 超簡易セッション（本番は非推奨だが今はOK）
+
 
 # =========================
-# UI
+# ログイン画面
+# =========================
+@app.get("/login", response_class=HTMLResponse)
+def login_page():
+    return """
+    <h2>Login</h2>
+    <form method="post" action="/login">
+        <input name="password" type="password" placeholder="password">
+        <button type="submit">Login</button>
+    </form>
+    """
+
+
+@app.post("/login")
+def login(password: str = Form(...)):
+    if password == APP_PASSWORD:
+        SESSION["auth"] = True
+        return RedirectResponse(url="/", status_code=302)
+    return HTMLResponse("❌ パスワード違う", status_code=401)
+
+
+# =========================
+# 認証チェック関数
+# =========================
+def check_auth():
+    return SESSION.get("auth", False)
+
+
+# =========================
+# ダッシュボード
 # =========================
 @app.get("/", response_class=HTMLResponse)
 def dashboard():
+
+    if not check_auth():
+        return RedirectResponse(url="/login")
+
     with open("index.html", "r", encoding="utf-8") as f:
         return f.read()
 
 
 # =========================
-# ポジション一覧
+# 状態確認
 # =========================
 @app.get("/positions")
 def positions():
@@ -24,36 +62,23 @@ def positions():
 
 
 # =========================
-# 監視・シグナル実行（安全化済み）
+# run
 # =========================
 @app.post("/run")
 def run():
 
-    try:
-        # 遅延import（起動時クラッシュ防止）
-        from monitor import run_monitor
-        from decision import try_entries, try_exits
+    if not check_auth():
+        return {"error": "unauthorized"}
 
-        run_monitor()
-        try_entries()
-        try_exits()
+    run_monitor()
+    try_entries()
+    try_exits()
 
-        return {
-            "status": "done",
-            "error": None
-        }
-
-    except Exception as e:
-
-        # ★重要：Renderを落とさない
-        return {
-            "status": "error",
-            "error": str(e)
-        }
+    return {"status": "done"}
 
 
 # =========================
-# ENTRY（手動登録）
+# ENTRY
 # =========================
 @app.post("/entry")
 def entry(
@@ -75,18 +100,15 @@ def entry(
         "entry_price2": p2,
         "qty1": q1,
         "qty2": q2,
-        "notional": p1 * q1 + p2 * q2,
+        "notional": p1*q1 + p2*q2,
         "zscore_entry": 0
     })
 
-    return {
-        "status": "entry saved",
-        "pair": pair
-    }
+    return {"status": "entry saved"}
 
 
 # =========================
-# EXIT（手動決済）
+# EXIT
 # =========================
 @app.post("/exit")
 def exit(
@@ -99,10 +121,7 @@ def exit(
     target = next((r for r in rows if r[1] == pair), None)
 
     if not target:
-        return {
-            "status": "error",
-            "error": "no position"
-        }
+        return {"error": "no position"}
 
     entry_p1 = target[6]
     entry_p2 = target[7]
@@ -118,8 +137,4 @@ def exit(
         pnl=pnl
     )
 
-    return {
-        "status": "closed",
-        "pair": pair,
-        "pnl": pnl
-    }
+    return {"status": "closed", "pnl": pnl}
