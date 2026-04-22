@@ -16,7 +16,7 @@ def dashboard():
 
 
 # =========================
-# 状態確認
+# ポジション一覧
 # =========================
 @app.get("/positions")
 def positions():
@@ -24,24 +24,36 @@ def positions():
 
 
 # =========================
-# バッチ実行（遅延importでクラッシュ回避）
+# 監視・シグナル実行（安全化済み）
 # =========================
 @app.post("/run")
 def run():
 
-    # ★重要：起動時に読み込まない（Render対策）
-    from monitor import run_monitor
-    from decision import try_entries, try_exits
+    try:
+        # 遅延import（起動時クラッシュ防止）
+        from monitor import run_monitor
+        from decision import try_entries, try_exits
 
-    run_monitor()
-    try_entries()
-    try_exits()
+        run_monitor()
+        try_entries()
+        try_exits()
 
-    return {"status": "done"}
+        return {
+            "status": "done",
+            "error": None
+        }
+
+    except Exception as e:
+
+        # ★重要：Renderを落とさない
+        return {
+            "status": "error",
+            "error": str(e)
+        }
 
 
 # =========================
-# ENTRY
+# ENTRY（手動登録）
 # =========================
 @app.post("/entry")
 def entry(
@@ -67,11 +79,14 @@ def entry(
         "zscore_entry": 0
     })
 
-    return {"status": "entry saved"}
+    return {
+        "status": "entry saved",
+        "pair": pair
+    }
 
 
 # =========================
-# EXIT
+# EXIT（手動決済）
 # =========================
 @app.post("/exit")
 def exit(
@@ -84,7 +99,10 @@ def exit(
     target = next((r for r in rows if r[1] == pair), None)
 
     if not target:
-        return {"error": "no position"}
+        return {
+            "status": "error",
+            "error": "no position"
+        }
 
     entry_p1 = target[6]
     entry_p2 = target[7]
@@ -100,4 +118,8 @@ def exit(
         pnl=pnl
     )
 
-    return {"status": "closed", "pnl": pnl}
+    return {
+        "status": "closed",
+        "pair": pair,
+        "pnl": pnl
+    }
