@@ -2,8 +2,6 @@ from fastapi import FastAPI, Form
 from fastapi.responses import HTMLResponse
 
 from trade_db import get_open_positions, open_position, close_position
-from decision import try_entries, try_exits
-from monitor import run_monitor
 
 app = FastAPI()
 
@@ -18,7 +16,7 @@ def dashboard():
 
 
 # =========================
-# 状態取得
+# 状態確認
 # =========================
 @app.get("/positions")
 def positions():
@@ -26,18 +24,24 @@ def positions():
 
 
 # =========================
-# バッチ実行（監視＋判定）
+# バッチ実行（遅延importでクラッシュ回避）
 # =========================
 @app.post("/run")
 def run():
+
+    # ★重要：起動時に読み込まない（Render対策）
+    from monitor import run_monitor
+    from decision import try_entries, try_exits
+
     run_monitor()
     try_entries()
     try_exits()
+
     return {"status": "done"}
 
 
 # =========================
-# ENTRY（UI）
+# ENTRY
 # =========================
 @app.post("/entry")
 def entry(
@@ -67,7 +71,7 @@ def entry(
 
 
 # =========================
-# EXIT（UI）
+# EXIT
 # =========================
 @app.post("/exit")
 def exit(
