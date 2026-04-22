@@ -1,14 +1,22 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Form
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
+
 from trade_db import get_open_positions, open_position, close_position
 from decision import try_entries, try_exits
 from monitor import run_monitor
 
+import os
+
 app = FastAPI()
 
-
-@app.get("/")
-def root():
-    return {"msg": "trading bot running"}
+# =========================
+# UI表示
+# =========================
+@app.get("/", response_class=HTMLResponse)
+def dashboard():
+    with open("index.html", "r", encoding="utf-8") as f:
+        return f.read()
 
 
 # =========================
@@ -16,15 +24,31 @@ def root():
 # =========================
 @app.get("/positions")
 def positions():
-    rows = get_open_positions()
-    return rows
+    return get_open_positions()
 
 
 # =========================
-# エントリー
+# 監視＋シグナル実行
+# =========================
+@app.post("/run")
+def run():
+    run_monitor()
+    try_entries()
+    try_exits()
+    return {"status": "done"}
+
+
+# =========================
+# エントリー登録（UI用）
 # =========================
 @app.post("/entry")
-def entry(pair: str, p1: float, p2: float, q1: int, q2: int):
+def entry(
+    pair: str = Form(...),
+    p1: float = Form(...),
+    p2: float = Form(...),
+    q1: int = Form(...),
+    q2: int = Form(...)
+):
 
     s1, s2 = pair.split("-")
 
@@ -37,17 +61,22 @@ def entry(pair: str, p1: float, p2: float, q1: int, q2: int):
         "entry_price2": p2,
         "qty1": q1,
         "qty2": q2,
-        "notional": p1*q1 + p2*q2
+        "notional": p1*q1 + p2*q2,
+        "zscore_entry": 0
     })
 
-    return {"status": "ok"}
+    return {"status": "entry saved"}
 
 
 # =========================
-# EXIT（手動価格入力 + PnL再計算）
+# EXIT登録（UI用）
 # =========================
 @app.post("/exit")
-def exit(pair: str, p1: float, p2: float):
+def exit(
+    pair: str = Form(...),
+    p1: float = Form(...),
+    p2: float = Form(...)
+):
 
     rows = get_open_positions()
     target = next((r for r in rows if r[1] == pair), None)
@@ -60,7 +89,6 @@ def exit(pair: str, p1: float, p2: float):
     qty1 = target[8]
     qty2 = target[9]
 
-    # ★PnLをexit価格ベースで再計算（最小修正）
     pnl = (p1 - entry_p1) * qty1 + (entry_p2 - p2) * qty2
 
     close_position(
@@ -70,15 +98,4 @@ def exit(pair: str, p1: float, p2: float):
         pnl=pnl
     )
 
-    return {"status": "closed"}
-
-
-# =========================
-# バッチ実行
-# =========================
-@app.post("/run")
-def run():
-    run_monitor()
-    try_entries()
-    try_exits()
-    return {"status": "done"}
+    return {"status": "closed", "pnl": pnl}
