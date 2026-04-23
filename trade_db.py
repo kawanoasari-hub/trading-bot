@@ -165,7 +165,6 @@ def update_position_state(pair_id, price1, price2, pnl, z):
     conn.close()
 
 
-# ★ここだけ変更（exit価格保存対応）
 def close_position(pair_id, exit_p1=None, exit_p2=None, pnl=0):
 
     conn = get_conn()
@@ -243,3 +242,21 @@ def upsert_pair(data):
 
     conn.commit()
     conn.close()
+
+
+# =========================
+# ★追加（これだけ）
+# =========================
+def get_all_positions():
+
+    conn = get_conn()
+    c = conn.cursor()
+
+    c.execute("""
+    SELECT * FROM positions
+    """)
+
+    rows = c.fetchall()
+    conn.close()
+
+    return rows
