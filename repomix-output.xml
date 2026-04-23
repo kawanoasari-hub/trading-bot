@@ -45,6 +45,8 @@ config.py
 decision.py
 index.html
 monitor.py
+performance.py
+requirements.txt
 run.py
 selection.py
 telegram_bot.py
@@ -55,91 +57,85 @@ trades.db
 <files>
 This section contains the contents of the repository's files.
 
-<file path="app.py">
-from fastapi import FastAPI
-from trade_db import get_open_positions, open_position, close_position
-from decision import try_entries, try_exits
-from monitor import run_monitor
-
-app = FastAPI()
+<file path="performance.py">
+import requests
+from trade_db import get_all_positions
+from config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
 
 
-@app.get("/")
-def root():
-    return {"msg": "trading bot running"}
+def send(msg):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
-
-# =========================
-# 状態確認
-# =========================
-@app.get("/positions")
-def positions():
-    rows = get_open_positions()
-    return rows
-
-
-# =========================
-# エントリー
-# =========================
-@app.post("/entry")
-def entry(pair: str, p1: float, p2: float, q1: int, q2: int):
-
-    s1, s2 = pair.split("-")
-
-    open_position({
-        "pair_id": pair,
-        "s1": s1,
-        "s2": s2,
-        "direction": "MANUAL",
-        "entry_price1": p1,
-        "entry_price2": p2,
-        "qty1": q1,
-        "qty2": q2,
-        "notional": p1*q1 + p2*q2
+    res = requests.post(url, data={
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": msg
     })
 
-    return {"status": "ok"}
+    print(res.text)
 
 
-# =========================
-# EXIT（手動価格入力 + PnL再計算）
-# =========================
-@app.post("/exit")
-def exit(pair: str, p1: float, p2: float):
+rows = get_all_positions()
 
-    rows = get_open_positions()
-    target = next((r for r in rows if r[1] == pair), None)
+total_trades = 0
+win_trades = 0
+lose_trades = 0
+total_pnl = 0
 
-    if not target:
-        return {"error": "no position"}
+monthly = {}
 
-    entry_p1 = target[6]
-    entry_p2 = target[7]
-    qty1 = target[8]
-    qty2 = target[9]
+for r in rows:
 
-    # ★PnLをexit価格ベースで再計算（最小修正）
-    pnl = (p1 - entry_p1) * qty1 + (entry_p2 - p2) * qty2
+    status = r[11]
 
-    close_position(
-        pair_id=pair,
-        exit_p1=p1,
-        exit_p2=p2,
-        pnl=pnl
-    )
+    if status != "CLOSED":
+        continue
 
-    return {"status": "closed"}
+    pnl = r[12]
+    exit_date = r[16]  # ★ここが変わる
+
+    if not exit_date:
+        continue
+
+    month = exit_date[:7]
+
+    total_trades += 1
+    total_pnl += pnl
+
+    if pnl > 0:
+        win_trades += 1
+    else:
+        lose_trades += 1
+
+    if month not in monthly:
+        monthly[month] = 0
+
+    monthly[month] += pnl
 
 
-# =========================
-# バッチ実行
-# =========================
-@app.post("/run")
-def run():
-    run_monitor()
-    try_entries()
-    try_exits()
-    return {"status": "done"}
+if total_trades == 0:
+    send("📊 決済なし")
+    exit()
+
+win_rate = win_trades / total_trades * 100
+avg_pnl = total_pnl / total_trades
+
+msg = "📈 運用成績\n"
+
+msg += (
+    f"\n総トレード数：{total_trades}"
+    f"\n勝ち：{win_trades}"
+    f"\n負け：{lose_trades}"
+    f"\n勝率：{win_rate:.1f}%"
+    f"\n総損益：{int(total_pnl):+,} 円"
+    f"\n平均損益：{int(avg_pnl):+,} 円"
+)
+
+msg += "\n\n【月次】"
+
+for m in sorted(monthly.keys()):
+    msg += f"\n{m} : {int(monthly[m]):+,} 円"
+
+send(msg)
 </file>
 
 <file path="config.py">
@@ -153,36 +149,6 @@ TELEGRAM_CHAT_ID = 7919205087
 # 設定（必要なら）
 # =========================
 MAX_NOTIONAL = 1_000_000
-</file>
-
-<file path="index.html">
-<!DOCTYPE html>
-<html>
-<body>
-
-<h1>Trading Bot</h1>
-
-<button onclick="run()">Run</button>
-<button onclick="load()">Positions</button>
-
-<pre id="out"></pre>
-
-<script>
-async function run(){
-  let res = await fetch('/run', {method:'POST'})
-  let data = await res.json()
-  document.getElementById('out').innerText = JSON.stringify(data,null,2)
-}
-
-async function load(){
-  let res = await fetch('/positions')
-  let data = await res.json()
-  document.getElementById('out').innerText = JSON.stringify(data,null,2)
-}
-</script>
-
-</body>
-</html>
 </file>
 
 <file path="run.py">
@@ -785,6 +751,17 @@ def run_monitor():
             print("error:", pair_id, e)
 </file>
 
+<file path="requirements.txt">
+fastapi
+uvicorn
+python-multipart
+yfinance
+numpy
+pandas
+statsmodels
+requests
+</file>
+
 <file path="selection.py">
 import yfinance as yf
 import numpy as np
@@ -1028,6 +1005,95 @@ if __name__ == "__main__":
     run_selection()
 </file>
 
+<file path="index.html">
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Pair Trading Dashboard</title>
+</head>
+<body>
+
+<h1>📊 Pair Trading Dashboard</h1>
+
+<hr>
+
+<h2>▶ シグナル実行</h2>
+<button onclick="run()">RUN</button>
+
+<hr>
+
+<h2>📥 ENTRY</h2>
+<form id="entryForm">
+  Pair: <input name="pair"><br>
+  Price1: <input name="p1"><br>
+  Price2: <input name="p2"><br>
+  Qty1: <input name="q1"><br>
+  Qty2: <input name="q2"><br>
+  <button type="submit">ENTRY</button>
+</form>
+
+<hr>
+
+<h2>📤 EXIT</h2>
+<form id="exitForm">
+  Pair: <input name="pair"><br>
+  Price1: <input name="p1"><br>
+  Price2: <input name="p2"><br>
+  <button type="submit">EXIT</button>
+</form>
+
+<hr>
+
+<h2>📊 Positions</h2>
+<button onclick="load()">Reload</button>
+
+<pre id="out"></pre>
+
+<script>
+
+async function run(){
+  const res = await fetch("/run", {method:"POST"})
+  const data = await res.json()
+  alert(JSON.stringify(data))
+}
+
+document.getElementById("entryForm").onsubmit = async (e) => {
+  e.preventDefault()
+  const f = new FormData(e.target)
+
+  const res = await fetch("/entry", {
+    method: "POST",
+    body: f
+  })
+
+  alert(JSON.stringify(await res.json()))
+}
+
+document.getElementById("exitForm").onsubmit = async (e) => {
+  e.preventDefault()
+  const f = new FormData(e.target)
+
+  const res = await fetch("/exit", {
+    method: "POST",
+    body: f
+  })
+
+  alert(JSON.stringify(await res.json()))
+}
+
+async function load(){
+  const res = await fetch("/positions")
+  const data = await res.json()
+  document.getElementById("out").innerText = JSON.stringify(data, null, 2)
+}
+
+</script>
+
+</body>
+</html>
+</file>
+
 <file path="trade_db.py">
 import sqlite3
 from datetime import datetime
@@ -1043,44 +1109,13 @@ def get_conn():
 
 
 # =========================
-# init DB
+# init DB（←これが無かった）
 # =========================
 def init_db():
 
     conn = get_conn()
     c = conn.cursor()
 
-    # pairs
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS pairs (
-        pair_id TEXT PRIMARY KEY,
-        s1 TEXT,
-        s2 TEXT,
-        sector TEXT,
-        beta REAL,
-        half_life REAL,
-        spread_std REAL,
-        status TEXT DEFAULT 'WATCH'
-    )
-    """)
-
-    # market_state（統一版）
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS market_state (
-        pair_id TEXT PRIMARY KEY,
-        s1 TEXT,
-        s2 TEXT,
-        beta REAL,
-        half_life REAL,
-        spread_std REAL,
-        current_price1 REAL,
-        current_price2 REAL,
-        zscore_current REAL,
-        updated_at TEXT
-    )
-    """)
-
-    # positions（※ exit価格カラム追加済み）
     c.execute("""
     CREATE TABLE IF NOT EXISTS positions (
         position_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1099,20 +1134,8 @@ def init_db():
         zscore_entry REAL,
         exit_price1 REAL,
         exit_price2 REAL,
+        exit_date TEXT,
         updated_at TEXT
-    )
-    """)
-
-    # trades
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS trades (
-        trade_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        position_id INTEGER,
-        pair_id TEXT,
-        pnl REAL,
-        return_pct REAL,
-        win INTEGER,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
     )
     """)
 
@@ -1121,24 +1144,22 @@ def init_db():
 
 
 # =========================
-# positions
+# 全取得
 # =========================
-def get_open_positions():
-
+def get_all_positions():
     conn = get_conn()
     c = conn.cursor()
 
-    c.execute("""
-    SELECT *
-    FROM positions
-    WHERE status = 'OPEN'
-    """)
-
+    c.execute("SELECT * FROM positions")
     rows = c.fetchall()
+
     conn.close()
     return rows
 
 
+# =========================
+# open
+# =========================
 def open_position(data):
 
     conn = get_conn()
@@ -1176,31 +1197,16 @@ def open_position(data):
     conn.close()
 
 
-def update_position_state(pair_id, price1, price2, pnl, z):
+# =========================
+# close
+# =========================
+def close_position(pair_id, exit_p1=None, exit_p2=None, pnl=0, exit_date=None):
 
     conn = get_conn()
     c = conn.cursor()
 
-    c.execute("""
-    UPDATE positions
-    SET pnl = ?,
-        updated_at = ?
-    WHERE pair_id = ? AND status = 'OPEN'
-    """, (
-        pnl,
-        datetime.now().isoformat(),
-        pair_id
-    ))
-
-    conn.commit()
-    conn.close()
-
-
-# ★ここだけ変更（exit価格保存対応）
-def close_position(pair_id, exit_p1=None, exit_p2=None, pnl=0):
-
-    conn = get_conn()
-    c = conn.cursor()
+    if exit_date is None:
+        exit_date = datetime.now().isoformat()
 
     c.execute("""
     UPDATE positions
@@ -1208,72 +1214,176 @@ def close_position(pair_id, exit_p1=None, exit_p2=None, pnl=0):
         pnl = ?,
         exit_price1 = ?,
         exit_price2 = ?,
+        exit_date = ?,
         updated_at = ?
     WHERE pair_id = ? AND status = 'OPEN'
     """, (
         pnl,
         exit_p1,
         exit_p2,
+        exit_date,
         datetime.now().isoformat(),
         pair_id
     ))
 
     conn.commit()
     conn.close()
+</file>
+
+<file path="app.py">
+from fastapi import FastAPI, Form
+from fastapi.responses import HTMLResponse, RedirectResponse
+from trade_db import get_open_positions, open_position, close_position
+from decision import try_entries, try_exits
+from monitor import run_monitor
+import os
+
+app = FastAPI()
+
+# =========================
+# ログイン設定
+# =========================
+APP_PASSWORD = os.environ.get("APP_PASSWORD")
+SESSION = {"logged_in": False}
+
+
+def check_login():
+    return SESSION.get("logged_in", False)
 
 
 # =========================
-# market_state
+# ログイン画面
 # =========================
-def upsert_market_state(data):
+@app.get("/login", response_class=HTMLResponse)
+def login_page():
+    return """
+    <h1>Login</h1>
+    <form method="post" action="/login">
+        <input type="password" name="password" placeholder="password">
+        <button type="submit">Login</button>
+    </form>
+    """
 
-    conn = get_conn()
-    c = conn.cursor()
 
-    c.execute("""
-    INSERT OR REPLACE INTO market_state (
-        pair_id, s1, s2,
-        beta, half_life, spread_std,
-        current_price1, current_price2,
-        zscore_current,
-        updated_at
+@app.post("/login")
+def login(password: str = Form(...)):
+    if password == APP_PASSWORD:
+        SESSION["logged_in"] = True
+        return RedirectResponse("/", status_code=302)
+    return HTMLResponse("wrong password", status_code=401)
+
+
+@app.get("/logout")
+def logout():
+    SESSION["logged_in"] = False
+    return RedirectResponse("/login", status_code=302)
+
+
+# =========================
+# ダッシュボード
+# =========================
+@app.get("/", response_class=HTMLResponse)
+def dashboard():
+    if not check_login():
+        return RedirectResponse("/login")
+
+    with open("index.html", "r", encoding="utf-8") as f:
+        return f.read()
+
+
+# =========================
+# ポジション確認
+# =========================
+@app.get("/positions")
+def positions():
+    if not check_login():
+        return {"error": "unauthorized"}
+
+    return get_open_positions()
+
+
+# =========================
+# 監視＋シグナル実行
+# =========================
+@app.post("/run")
+def run():
+    if not check_login():
+        return {"error": "unauthorized"}
+
+    run_monitor()
+    try_entries()
+    try_exits()
+
+    return {"status": "done"}
+
+
+# =========================
+# ENTRY
+# =========================
+@app.post("/entry")
+def entry(
+    pair: str = Form(...),
+    p1: float = Form(...),
+    p2: float = Form(...),
+    q1: int = Form(...),
+    q2: int = Form(...)
+):
+
+    if not check_login():
+        return {"error": "unauthorized"}
+
+    s1, s2 = pair.split("-")
+
+    open_position({
+        "pair_id": pair,
+        "s1": s1,
+        "s2": s2,
+        "direction": "MANUAL",
+        "entry_price1": p1,
+        "entry_price2": p2,
+        "qty1": q1,
+        "qty2": q2,
+        "notional": p1 * q1 + p2 * q2,
+        "zscore_entry": 0
+    })
+
+    return {"status": "entry saved"}
+
+
+# =========================
+# EXIT
+# =========================
+@app.post("/exit")
+def exit(
+    pair: str = Form(...),
+    p1: float = Form(...),
+    p2: float = Form(...)
+):
+
+    if not check_login():
+        return {"error": "unauthorized"}
+
+    rows = get_open_positions()
+    target = next((r for r in rows if r[1] == pair), None)
+
+    if not target:
+        return {"error": "no position"}
+
+    entry_p1 = target[6]
+    entry_p2 = target[7]
+    qty1 = target[8]
+    qty2 = target[9]
+
+    pnl = (p1 - entry_p1) * qty1 + (entry_p2 - p2) * qty2
+
+    close_position(
+        pair_id=pair,
+        exit_p1=p1,
+        exit_p2=p2,
+        pnl=pnl
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, data)
 
-    conn.commit()
-    conn.close()
-
-
-# =========================
-# pairs UPSERT
-# =========================
-def upsert_pair(data):
-
-    conn = get_conn()
-    c = conn.cursor()
-
-    c.execute("""
-    INSERT OR REPLACE INTO pairs (
-        pair_id, s1, s2,
-        sector,
-        beta, half_life, spread_std,
-        status
-    )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        data["pair_id"],
-        data["s1"],
-        data["s2"],
-        data["sector"],
-        data["beta"],
-        data["half_life"],
-        data["spread_std"],
-        data.get("status", "WATCH")
-    ))
-
-    conn.commit()
-    conn.close()
+    return {"status": "closed", "pnl": pnl}
 </file>
 
 </files>

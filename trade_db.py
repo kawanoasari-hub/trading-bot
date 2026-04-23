@@ -4,9 +4,6 @@ from datetime import datetime
 DB_NAME = "trades.db"
 
 
-# =========================
-# connection
-# =========================
 def get_conn():
     return sqlite3.connect(DB_NAME)
 
@@ -25,7 +22,6 @@ def init_db():
         pair_id TEXT PRIMARY KEY,
         s1 TEXT,
         s2 TEXT,
-        sector TEXT,
         beta REAL,
         half_life REAL,
         spread_std REAL,
@@ -33,23 +29,7 @@ def init_db():
     )
     """)
 
-    # market_state（統一版）
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS market_state (
-        pair_id TEXT PRIMARY KEY,
-        s1 TEXT,
-        s2 TEXT,
-        beta REAL,
-        half_life REAL,
-        spread_std REAL,
-        current_price1 REAL,
-        current_price2 REAL,
-        zscore_current REAL,
-        updated_at TEXT
-    )
-    """)
-
-    # positions（※ exit価格カラム追加済み）
+    # positions
     c.execute("""
     CREATE TABLE IF NOT EXISTS positions (
         position_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -68,20 +48,24 @@ def init_db():
         zscore_entry REAL,
         exit_price1 REAL,
         exit_price2 REAL,
+        exit_date TEXT,
         updated_at TEXT
     )
     """)
 
-    # trades
+    # market_state
     c.execute("""
-    CREATE TABLE IF NOT EXISTS trades (
-        trade_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        position_id INTEGER,
-        pair_id TEXT,
-        pnl REAL,
-        return_pct REAL,
-        win INTEGER,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    CREATE TABLE IF NOT EXISTS market_state (
+        pair_id TEXT PRIMARY KEY,
+        s1 TEXT,
+        s2 TEXT,
+        beta REAL,
+        half_life REAL,
+        spread_std REAL,
+        current_price1 REAL,
+        current_price2 REAL,
+        zscore_current REAL,
+        updated_at TEXT
     )
     """)
 
@@ -90,19 +74,50 @@ def init_db():
 
 
 # =========================
-# positions
+# pairs UPSERT（←これが足りなかった）
 # =========================
-def get_open_positions():
+def upsert_pair(data):
 
     conn = get_conn()
     c = conn.cursor()
 
     c.execute("""
-    SELECT *
-    FROM positions
-    WHERE status = 'OPEN'
-    """)
+    INSERT OR REPLACE INTO pairs (
+        pair_id, s1, s2,
+        beta, half_life, spread_std,
+        status
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (
+        data["pair_id"],
+        data["s1"],
+        data["s2"],
+        data["beta"],
+        data["half_life"],
+        data["spread_std"],
+        data.get("status", "WATCH")
+    ))
 
+    conn.commit()
+    conn.close()
+
+
+# =========================
+# positions系
+# =========================
+def get_all_positions():
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT * FROM positions")
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def get_open_positions():
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT * FROM positions WHERE status='OPEN'")
     rows = c.fetchall()
     conn.close()
     return rows
@@ -152,9 +167,8 @@ def update_position_state(pair_id, price1, price2, pnl, z):
 
     c.execute("""
     UPDATE positions
-    SET pnl = ?,
-        updated_at = ?
-    WHERE pair_id = ? AND status = 'OPEN'
+    SET pnl = ?, updated_at = ?
+    WHERE pair_id = ? AND status='OPEN'
     """, (
         pnl,
         datetime.now().isoformat(),
@@ -165,23 +179,28 @@ def update_position_state(pair_id, price1, price2, pnl, z):
     conn.close()
 
 
-def close_position(pair_id, exit_p1=None, exit_p2=None, pnl=0):
+def close_position(pair_id, exit_p1=None, exit_p2=None, pnl=0, exit_date=None):
 
     conn = get_conn()
     c = conn.cursor()
 
+    if exit_date is None:
+        exit_date = datetime.now().isoformat()
+
     c.execute("""
     UPDATE positions
-    SET status = 'CLOSED',
-        pnl = ?,
-        exit_price1 = ?,
-        exit_price2 = ?,
-        updated_at = ?
-    WHERE pair_id = ? AND status = 'OPEN'
+    SET status='CLOSED',
+        pnl=?,
+        exit_price1=?,
+        exit_price2=?,
+        exit_date=?,
+        updated_at=?
+    WHERE pair_id=? AND status='OPEN'
     """, (
         pnl,
         exit_p1,
         exit_p2,
+        exit_date,
         datetime.now().isoformat(),
         pair_id
     ))
@@ -211,52 +230,3 @@ def upsert_market_state(data):
 
     conn.commit()
     conn.close()
-
-
-# =========================
-# pairs UPSERT
-# =========================
-def upsert_pair(data):
-
-    conn = get_conn()
-    c = conn.cursor()
-
-    c.execute("""
-    INSERT OR REPLACE INTO pairs (
-        pair_id, s1, s2,
-        sector,
-        beta, half_life, spread_std,
-        status
-    )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        data["pair_id"],
-        data["s1"],
-        data["s2"],
-        data["sector"],
-        data["beta"],
-        data["half_life"],
-        data["spread_std"],
-        data.get("status", "WATCH")
-    ))
-
-    conn.commit()
-    conn.close()
-
-
-# =========================
-# ★追加（これだけ）
-# =========================
-def get_all_positions():
-
-    conn = get_conn()
-    c = conn.cursor()
-
-    c.execute("""
-    SELECT * FROM positions
-    """)
-
-    rows = c.fetchall()
-    conn.close()
-
-    return rows
